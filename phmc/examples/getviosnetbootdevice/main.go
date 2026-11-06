@@ -13,12 +13,10 @@ import (
 
 func main() {
 	// NOTE:
-	// This example exercises GetNetworkBootDevices for a VIOS profile using the
-	// documented VirtualIOServer job flow. In validation against tested HMCs,
-	// the request is accepted only up to job submission and then fails with
-	// FAILED_TO_START because the HMC reports that
-	// LogicalPartitionProfileUUID is not allowed for this job, even though IBM
-	// documentation shows that parameter in the sample request.
+	// This example calls GetNetworkBootDevices for a VIOS using the name-based
+	// job parameters (managedSystemName, laparName, profileName, loggedinuser).
+	// The VIOS must be powered off; use the getviosnetbootdeviceimm example to
+	// have the HMC shut a running VIOS down immediately.
 	// =========================================================================
 	// CONFIGURATION & FLAGS
 	// =========================================================================
@@ -27,14 +25,13 @@ func main() {
 	password := flag.String("hmc-pass", "", "HMC password")
 	sysName := flag.String("system-name", "", "Managed System Name")
 	viosName := flag.String("vios-name", "", "Target VIOS Name")
-	verbose := flag.Bool("verbose", false, "Enable verbose output")
+	profileName := flag.String("profile-name", "", "VIOS Profile Name (leave blank to auto-detect)")
 	debug     := flag.Bool("debug",      false, "Log each HTTP request/response (bodies truncated at 2048 bytes)")
 	debugFull := flag.Bool("debug-full",  false, "Log each HTTP request/response with full body (no truncation)")
 	flag.Parse()
-	_ = verbose
 
-	if *password == "" || *sysName == "" || *viosName == "" {
-		log.Fatal("❌ Error: hmc-pass, system-name, and vios-name are required")
+	if *hmcIP == "" || *username == "" || *password == "" || *sysName == "" || *viosName == "" {
+		log.Fatal("❌ Error: hmc-ip, hmc-user, hmc-pass, system-name, and vios-name are required")
 	}
 
 	fmt.Println("=================================================================")
@@ -70,32 +67,40 @@ func main() {
 	}
 	fmt.Printf("✅ VIOS UUID: %s\n", viosUUID)
 
-	// 4. Fetch the Comprehensive VIOS Details to extract the Profile UUID
-	fmt.Println("Step 4: Fetching detailed VIOS configuration to extract Profile UUID...")
+	// 4. Check power state and resolve the profile name
+	fmt.Println("Step 4: Fetching VIOS details...")
 	viosDetailed, err := client.GetVirtualIOServer(context.Background(), viosUUID)
 	if err != nil {
 		log.Fatalf("❌ Failed to get VIOS details: %v", err)
 	}
-    
 	if viosDetailed.PartitionState == "running" {
 		fmt.Println("\n⚠️  WARNING: VIOS is currently RUNNING")
 		fmt.Println("   The GetNetworkBootDevices job requires the VIOS to be powered off first.")
-		fmt.Println("   Exiting to prevent destructive restart.")
+		fmt.Println("   Power it off, or use the getviosnetbootdeviceimm example. Exiting.")
 		return
 	}
 
-	profileHref := viosDetailed.AssociatedPartitionProfile.Href
-	var profileUUID string
-	if profileHref != "" {
-		profileUUID = profileHref[len(profileHref)-36:]
-		fmt.Printf("✅ Associated Profile UUID: %s\n", profileUUID)
-	} else {
-		log.Fatal("❌ No associated partition profile found for this VIOS - cannot retrieve network boot devices")
+	actualProfileName := *profileName
+	if actualProfileName == "" {
+		viosList, err := client.GetVirtualIOServersQuick(context.Background(), sysUUID)
+		if err != nil {
+			log.Fatalf("❌ Failed to fetch VIOS list from system: %v", err)
+		}
+		for _, v := range viosList {
+			if v.UUID == viosUUID {
+				actualProfileName = v.LastActivatedProfile
+				break
+			}
+		}
 	}
+	if actualProfileName == "" {
+		log.Fatal("❌ Could not determine profile name; pass -profile-name")
+	}
+	fmt.Printf("✅ Target Profile: %s\n", actualProfileName)
 
-	// 5. Fetch Network Boot Devices from profile
-	fmt.Println("\nStep 5: Firing GetNetworkBootDevices Job for VIOS profile...")
-	bootDevices, err := client.GetNetworkBootDevicesForVios(context.Background(), viosUUID, profileUUID)
+	// 5. Fetch Network Boot Devices
+	fmt.Println("\nStep 5: Firing GetNetworkBootDevices Job for VIOS...")
+	bootDevices, err := client.GetNetworkBootDevicesForVios(context.Background(), viosUUID, *sysName, *viosName, actualProfileName, *username)
 	if err != nil {
 		log.Fatalf("❌ GetNetworkBootDevices failed: %v", err)
 	}

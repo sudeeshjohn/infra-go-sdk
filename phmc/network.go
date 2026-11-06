@@ -383,27 +383,52 @@ func (c *RestClient) GetNetworkBootDevicesForLpar(ctx context.Context, lparUUID,
 	return bootDevices, nil
 }
 
-// GetNetworkBootDevicesForVios retrieves network boot devices from a VIOS profile
-// using the HMC REST API job.
+// GetNetworkBootDevicesForVios retrieves the network boot devices of a VIOS
+// partition using the HMC "GetNetworkBootDevices" VirtualIOServer job.
 //
-// WARNING: This operation will power off the VIOS if it is currently running.
-// The HMC GetNetworkBootDevices job requires the partition to be in a powered-off state.
+// The HMC runs lpar_netboot behind the scenes: it powers the partition on to
+// Open Firmware, collects the adapter location codes / MAC addresses and
+// closes the console again. The partition must therefore NOT be running.
+// Use GetNetworkBootDevicesForViosImmediate to also force a running VIOS down.
+//
+// Note: the job does not accept LogicalPartitionProfileUUID for VIOS targets;
+// it is parameterized by names (see the sibling Immediate variant).
 //
 // Parameters:
-//   - viosUUID: UUID of the Virtual I/O Server
-//   - profileUUID: UUID of the partition profile to query
-//   - debug: Enable detailed logging
+//   - viosUUID: UUID of the Virtual I/O Server (used in the endpoint URL)
+//   - sysName: managed system name (e.g. "LTC23U01-JEMT-P11")
+//   - viosName: VIOS partition name (e.g. "ltc23u01-vios1")
+//   - profileName: partition profile name (e.g. "default_profile")
+//   - loggedInUser: HMC user submitting the job (e.g. "hscroot")
+func (c *RestClient) GetNetworkBootDevicesForVios(ctx context.Context, viosUUID, sysName, viosName, profileName, loggedInUser string) ([]NetworkBootDevice, error) {
+	return c.getViosNetworkBootDevices(ctx, viosUUID, sysName, viosName, profileName, loggedInUser, false)
+}
+
+// GetNetworkBootDevicesForViosImmediate is like GetNetworkBootDevicesForVios
+// but sets the "withImmediate" job parameter to true, which makes the HMC shut
+// the VIOS down immediately if it is running.
 //
-// Returns:
-//   - []NetworkBootDevice: List of network boot devices configured in the profile
-//   - error: Error if the operation fails
-func (c *RestClient) GetNetworkBootDevicesForVios(ctx context.Context, viosUUID, profileUUID string) ([]NetworkBootDevice, error) {
-	url := fmt.Sprintf("https://%s/rest/api/uom/VirtualIOServer/%s/do/GetNetworkBootDevices", c.hmcIP, viosUUID)
+// WARNING: this is disruptive. A running VIOS is powered off immediately,
+// without a graceful OS shutdown.
+func (c *RestClient) GetNetworkBootDevicesForViosImmediate(ctx context.Context, viosUUID, sysName, viosName, profileName, loggedInUser string) ([]NetworkBootDevice, error) {
+	return c.getViosNetworkBootDevices(ctx, viosUUID, sysName, viosName, profileName, loggedInUser, true)
+}
 
+// buildViosNetworkBootDevicesPayload builds the JobRequest body for the VIOS
+// GetNetworkBootDevices job. All values are XML-escaped.
+func buildViosNetworkBootDevicesPayload(sysName, viosName, profileName, loggedInUser string, immediate bool) string {
+	params := []struct{ name, value string }{
+		{"managedSystemName", sysName},
+		{"laparName", viosName}, // sic: the HMC parameter is spelled "laparName"
+		{"profileName", profileName},
+		{"loggedinuser", loggedInUser},
+	}
+	if immediate {
+		params = append(params, struct{ name, value string }{"withImmediate", "true"})
+	}
 
-	// Payload constructed exactly matching the verified working configuration
-	// Using schemaVersion V1_0 and clean namespace architecture
-	payload := fmt.Sprintf(`<JobRequest
+	var sb strings.Builder
+	sb.WriteString(`<JobRequest
   xmlns="http://www.ibm.com/xmlns/systems/power/firmware/web/mc/2012_10/"
   xmlns:ns2="http://www.w3.org/XML/1998/namespace/k2" schemaVersion="V1_0">
   <Metadata>
@@ -420,34 +445,41 @@ func (c *RestClient) GetNetworkBootDevicesForVios(ctx context.Context, viosUUID,
     <Metadata>
       <Atom/>
     </Metadata>
-    <JobParameter schemaVersion="V1_0">
+`)
+	for _, p := range params {
+		fmt.Fprintf(&sb, `    <JobParameter schemaVersion="V1_0">
       <Metadata>
         <Atom/>
       </Metadata>
-      <ParameterName kb="ROR" kxe="false">LogicalPartitionProfileUUID</ParameterName>
+      <ParameterName kb="ROR" kxe="false">%s</ParameterName>
       <ParameterValue kxe="false" kb="CUR">%s</ParameterValue>
     </JobParameter>
-  </JobParameters>
-</JobRequest>`, profileUUID)
+`, p.name, html.EscapeString(p.value))
+	}
+	sb.WriteString("  </JobParameters>\n</JobRequest>")
+	return sb.String()
+}
 
-	// Create and execute HTTP request
-	req, err := http.NewRequest("PUT", url, strings.NewReader(payload))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %v", err)
+// getViosNetworkBootDevices submits the VIOS GetNetworkBootDevices job, waits
+// for completion and parses the resulting NetworkBootDevice_Collection.
+func (c *RestClient) getViosNetworkBootDevices(ctx context.Context, viosUUID, sysName, viosName, profileName, loggedInUser string, immediate bool) ([]NetworkBootDevice, error) {
+	if viosUUID == "" || sysName == "" || viosName == "" || profileName == "" || loggedInUser == "" {
+		return nil, fmt.Errorf("viosUUID, sysName, viosName, profileName and loggedInUser are all required")
 	}
 
-	req.Header.Set("X-API-Session", c.session)
-	// Notice the spacing: 'web+xml; type=JobRequest' exactly as the curl command requires
-	req.Header.Set("Content-Type", "application/vnd.ibm.powervm.web+xml; type=JobRequest")
-	req.Header.Set("Accept", "*/*")
-
-	// Instruct HMC to process using the compatible V1_2_0 schema rules matching the curl command
-	req.Header.Set("x-hmc-schema-version", "V1_2_0")
+	url := fmt.Sprintf("https://%s/rest/api/uom/VirtualIOServer/%s/do/GetNetworkBootDevices", c.hmcIP, viosUUID)
+	payload := buildViosNetworkBootDevicesPayload(sysName, viosName, profileName, loggedInUser, immediate)
 
 	timeoutCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
-	req = req.WithContext(timeoutCtx)
 
+	req, err := http.NewRequestWithContext(timeoutCtx, "PUT", url, strings.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %v", err)
+	}
+	req.Header.Set("X-API-Session", c.session)
+	req.Header.Set("Content-Type", "application/vnd.ibm.powervm.web+xml; type=JobRequest")
+	req.Header.Set("Accept", "*/*")
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -459,86 +491,79 @@ func (c *RestClient) GetNetworkBootDevicesForVios(ctx context.Context, viosUUID,
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response body: %v", err)
 	}
-
-
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusAccepted {
 		return nil, fmt.Errorf("request failed with status: %s, body: %s", resp.Status, string(respBody))
 	}
 
-	// Parse response to extract JobID
 	doc, err := xmlStripNamespace(respBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to strip namespaces from XML: %v", err)
 	}
-
 	jobIDElem := doc.FindElement("//JobID")
-	if jobIDElem == nil {
+	if jobIDElem == nil || strings.TrimSpace(jobIDElem.Text()) == "" {
 		return nil, fmt.Errorf("JobID not found in response")
 	}
-	jobID := jobIDElem.Text()
+	jobID := strings.TrimSpace(jobIDElem.Text())
 
-
-	// Wait for job completion
+	// The job power-cycles the partition to Open Firmware; it typically takes ~1 minute.
 	jobResp, err := c.FetchJobStatus(ctx, jobID, false, 5)
 	if err != nil {
 		return nil, fmt.Errorf("GetNetworkBootDevices job failed: %v", err)
 	}
 
-	// Parse job results to extract network boot devices
-	var bootDevices []NetworkBootDevice
-
-	for _, param := range jobResp.Results.Parameters {
-		if param.ParameterName == "result" {
-			xmlContent := param.ParameterValue
-
-			// 1. Clean the CDATA wrapper and unescape any HTML entities
-			xmlContent = strings.TrimSpace(xmlContent)
-			xmlContent = strings.TrimPrefix(xmlContent, "<![CDATA[")
-			xmlContent = strings.TrimSuffix(xmlContent, "]]>")
-			xmlContent = html.UnescapeString(strings.TrimSpace(xmlContent))
-
-
-			// 2. Strip Namespaces to make Unmarshaling easy
-			cleanDoc, err := xmlStripNamespace([]byte(xmlContent))
-			if err != nil {
-				continue
-			}
-			strippedXML, _ := cleanDoc.WriteToBytes()
-
-			// 3. Use an inline struct to map IBM's XML directly using standard encoding/xml
-			var collection struct {
-				Devices []struct {
-					BootDevice       string `xml:"BootDevice"`
-					IsPhysicalDevice bool   `xml:"IsPhysicalDevice"`
-					LocationCode     string `xml:"LocationCode"`
-					MACAddressValue  string `xml:"MACAddressValue"`
-				} `xml:"NetworkBootDevice"`
-			}
-
-			if err := xml.Unmarshal(strippedXML, &collection); err != nil {
-				continue
-			}
-
-			// 4. Map the unmarshaled data to your SDK's return struct
-			for _, d := range collection.Devices {
-				deviceType := "virtual"
-				if d.IsPhysicalDevice {
-					deviceType = "physical"
-				}
-
-				bootDevices = append(bootDevices, NetworkBootDevice{
-					DeviceName:   d.BootDevice,
-					DeviceType:   deviceType,
-					LocationCode: d.LocationCode,
-					MACAddress:   d.MACAddressValue,
-				})
-			}
-		}
-	}
-
-
-	return bootDevices, nil
+	return parseNetworkBootDevicesResult(jobResp)
 }
+
+// parseNetworkBootDevicesResult extracts the NetworkBootDevice_Collection that
+// the HMC returns, XML-escaped, in the job's "result" parameter.
+func parseNetworkBootDevicesResult(jobResp *JobResponse) ([]NetworkBootDevice, error) {
+	for _, param := range jobResp.Results.Parameters {
+		if param.ParameterName != "result" {
+			continue
+		}
+
+		xmlContent := strings.TrimSpace(param.ParameterValue)
+		xmlContent = strings.TrimPrefix(xmlContent, "<![CDATA[")
+		xmlContent = strings.TrimSuffix(xmlContent, "]]>")
+		xmlContent = html.UnescapeString(strings.TrimSpace(xmlContent))
+		if xmlContent == "" {
+			return nil, nil
+		}
+
+		cleanDoc, err := xmlStripNamespace([]byte(xmlContent))
+		if err != nil {
+			return nil, fmt.Errorf("failed to strip namespaces from result XML: %v", err)
+		}
+		strippedXML, err := cleanDoc.WriteToBytes()
+		if err != nil {
+			return nil, fmt.Errorf("failed to serialize result XML: %v", err)
+		}
+
+		var collection NetworkBootDeviceCollection
+		if err := xml.Unmarshal(strippedXML, &collection); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal NetworkBootDevice_Collection: %v", err)
+		}
+
+		devices := make([]NetworkBootDevice, 0, len(collection.Devices))
+		for _, d := range collection.Devices {
+			deviceType := "virtual"
+			if strings.EqualFold(strings.TrimSpace(d.IsPhysicalDevice), "true") {
+				deviceType = "physical"
+			}
+			devices = append(devices, NetworkBootDevice{
+				DeviceName:   strings.TrimSpace(d.BootDevice),
+				DeviceType:   deviceType,
+				LocationCode: strings.TrimSpace(d.LocationCode),
+				MACAddress:   strings.TrimSpace(d.MACAddressValue),
+			})
+		}
+		return devices, nil
+	}
+	return nil, nil
+}
+
+
+
 
 // CreateClientNetworkAdapter adds a new Virtual Ethernet Adapter to an LPAR and connects it to a Virtual Switch.
 // Returns the complete ClientNetworkAdapter structure with all details.
@@ -1589,172 +1614,3 @@ func (c *RestClient) DeleteNetworkBridge(ctx context.Context, sysUUID, bridgeUUI
 	return nil
 }
 
-// GetNetworkBootDevicesForViosImmediate retrieves network boot devices from a VIOS profile
-// using the HMC REST API job parameterized by system name, lpar name, and profile name.
-// This executes the job using the "withImmediate" flag.
-//
-// Parameters:
-//   - viosUUID: UUID of the Virtual I/O Server (used for the endpoint URL)
-//   - sysName: The managed system name (e.g., "hmc-denali5")
-//   - viosName: The VIOS LPAR name (e.g., "denali5-vios1")
-//   - profileName: The profile name (e.g., "default")
-//   - loggedInUser: The HMC user executing the request (e.g., "REDACTED_HMC_USER<==")
-//   - debug: Enable detailed logging
-//
-// Returns:
-//   - []NetworkBootDevice: List of network boot devices configured in the profile
-//   - error: Error if the operation fails
-func (c *RestClient) GetNetworkBootDevicesForViosImmediate(ctx context.Context, viosUUID, sysName, viosName, profileName, loggedInUser string) ([]NetworkBootDevice, error) {
-	url := fmt.Sprintf("https://%s/rest/api/uom/VirtualIOServer/%s/do/GetNetworkBootDevices", c.hmcIP, viosUUID)
-
-
-	// Payload constructed exactly matching your working curl command
-	payload := fmt.Sprintf(`<JobRequest
-  xmlns="http://www.ibm.com/xmlns/systems/power/firmware/web/mc/2012_10/"
-  xmlns:ns2="http://www.w3.org/XML/1998/namespace/k2" schemaVersion="V1_0">
-  <Metadata>
-    <Atom/>
-  </Metadata>
-  <RequestedOperation kxe="false" kb="CUR" schemaVersion="V1_0">
-    <Metadata>
-      <Atom/>
-    </Metadata>
-    <OperationName kxe="false" kb="ROR">GetNetworkBootDevices</OperationName>
-    <GroupName kxe="false" kb="ROR">VirtualIOServer</GroupName>
-  </RequestedOperation>
-  <JobParameters kxe="false" kb="CUR" schemaVersion="V1_0">
-    <Metadata>
-      <Atom/>
-    </Metadata>
-    <JobParameter schemaVersion="V1_0">
-      <Metadata>
-        <Atom/>
-      </Metadata>
-      <ParameterName kb="ROR" kxe="false">managedSystemName</ParameterName>
-      <ParameterValue kxe="false" kb="CUR">%s</ParameterValue>
-    </JobParameter>
-    <JobParameter schemaVersion="V1_0">
-      <Metadata>
-        <Atom/>
-      </Metadata>
-      <ParameterName kb="ROR" kxe="false">laparName</ParameterName>
-      <ParameterValue kxe="false" kb="CUR">%s</ParameterValue>
-    </JobParameter>
-    <JobParameter schemaVersion="V1_0">
-      <Metadata>
-        <Atom/>
-      </Metadata>
-      <ParameterName kb="ROR" kxe="false">profileName</ParameterName>
-      <ParameterValue kxe="false" kb="CUR">%s</ParameterValue>
-    </JobParameter>
-    <JobParameter schemaVersion="V1_0">
-      <Metadata>
-        <Atom/>
-      </Metadata>
-      <ParameterName kb="ROR" kxe="false">loggedinuser</ParameterName>
-      <ParameterValue kxe="false" kb="CUR">%s</ParameterValue>
-    </JobParameter>
-  </JobParameters>
-</JobRequest>`, sysName, viosName, profileName, loggedInUser)
-
-	// Create and execute HTTP request
-	req, err := http.NewRequest("PUT", url, strings.NewReader(payload))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %v", err)
-	}
-
-	req.Header.Set("X-API-Session", c.session)
-	req.Header.Set("Content-Type", "application/vnd.ibm.powervm.web+xml; type=JobRequest")
-	req.Header.Set("Accept", "*/*")
-	// Intentionally omitting x-hmc-schema-version to match working curl
-
-	timeoutCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
-	defer cancel()
-	req = req.WithContext(timeoutCtx)
-
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("HTTP request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %v", err)
-	}
-
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusAccepted {
-		return nil, fmt.Errorf("request failed with status: %s, body: %s", resp.Status, string(respBody))
-	}
-
-	// Parse response to extract JobID
-	doc, err := xmlStripNamespace(respBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to strip namespaces from XML: %v", err)
-	}
-
-	jobIDElem := doc.FindElement("//JobID")
-	if jobIDElem == nil {
-		return nil, fmt.Errorf("JobID not found in response")
-	}
-	jobID := jobIDElem.Text()
-
-
-	// Wait for job completion
-	jobResp, err := c.FetchJobStatus(ctx, jobID, false, 5)
-	if err != nil {
-		return nil, fmt.Errorf("GetNetworkBootDevices job failed: %v", err)
-	}
-
-	// Parse job results to extract network boot devices
-	var bootDevices []NetworkBootDevice
-
-	for _, param := range jobResp.Results.Parameters {
-		if param.ParameterName == "result" {
-			xmlContent := param.ParameterValue
-
-			// Clean the CDATA wrapper and unescape any HTML entities
-			xmlContent = strings.TrimSpace(xmlContent)
-			xmlContent = strings.TrimPrefix(xmlContent, "<![CDATA[")
-			xmlContent = strings.TrimSuffix(xmlContent, "]]>")
-			xmlContent = html.UnescapeString(strings.TrimSpace(xmlContent))
-
-			cleanDoc, err := xmlStripNamespace([]byte(xmlContent))
-			if err != nil {
-				continue
-			}
-			strippedXML, _ := cleanDoc.WriteToBytes()
-
-			var collection struct {
-				Devices []struct {
-					BootDevice       string `xml:"BootDevice"`
-					IsPhysicalDevice bool   `xml:"IsPhysicalDevice"`
-					LocationCode     string `xml:"LocationCode"`
-					MACAddressValue  string `xml:"MACAddressValue"`
-				} `xml:"NetworkBootDevice"`
-			}
-
-			if err := xml.Unmarshal(strippedXML, &collection); err != nil {
-				continue
-			}
-
-			for _, d := range collection.Devices {
-				deviceType := "virtual"
-				if d.IsPhysicalDevice {
-					deviceType = "physical"
-				}
-
-				bootDevices = append(bootDevices, NetworkBootDevice{
-					DeviceName:   d.BootDevice,
-					DeviceType:   deviceType,
-					LocationCode: d.LocationCode,
-					MACAddress:   d.MACAddressValue,
-				})
-			}
-		}
-	}
-
-	return bootDevices, nil
-}
