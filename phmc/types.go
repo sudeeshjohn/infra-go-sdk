@@ -4100,8 +4100,23 @@ type NetworkBridge struct {
 	LoadGroups             []LoadGroup             `xml:"LoadGroups>LoadGroup"`
 }
 
-// CreateNetworkBridgeRequest holds the parameters needed to provision a new Network Bridge.
+// NetworkBridgeLoadGroup describes one HMC NetworkBridge LoadGroup.
+//
+// PortVLANID is the PVID of the trunk-adapter pair represented by the LoadGroup.
+// VirtualNetworkUUIDs lists the existing Virtual Networks associated with it.
+// When empty, the Virtual Network whose NetworkVLANID equals PortVLANID is
+// looked up on the managed system.
+type NetworkBridgeLoadGroup struct {
+	PortVLANID          int
+	VirtualNetworkUUIDs []string
+}
+
 // CreateNetworkBridgeRequest defines the parameters for provisioning a bridge.
+//
+// Per the HMC REST API, a NetworkBridge needs at least one LoadGroup, at least
+// two when LoadBalancingEnabled is true, and one LoadGroup PVID must equal
+// PortVLANID. ControlChannelID is optional on managed systems that report
+// ManagementVLANForControlChannelCapable; otherwise the HMC requires it for failover.
 type CreateNetworkBridgeRequest struct {
 	PortVLANID             int
 	FailoverEnabled        bool
@@ -4113,5 +4128,10 @@ type CreateNetworkBridgeRequest struct {
 	SecondaryBackingDevice string
 	JumboFramesEnabled     bool
 	LargeSend              bool
-	LoadGroupVLANs         []int // Converted list of tracking data VLANs (e.g., [1127, 1128])
+	// LoadGroups is the preferred way to describe the bridge LoadGroups.
+	LoadGroups []NetworkBridgeLoadGroup
+
+	// Deprecated: use LoadGroups. Each VLAN becomes one LoadGroup with that PVID.
+	// Cannot be combined with LoadGroups.
+	LoadGroupVLANs []int
 }

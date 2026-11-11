@@ -1342,51 +1342,147 @@ func (c *RestClient) GetNetworkBridge(ctx context.Context, sysUUID, bridgeUUID s
 }
 
 
+// normalizeNetworkBridgeLoadGroups merges the preferred LoadGroups field and the
+// deprecated LoadGroupVLANs field into one list. A bridge without load balancing
+// defaults to a single LoadGroup whose PVID equals the bridge PortVLANID. For load
+// balancing no group is invented; the caller must supply at least two.
+func normalizeNetworkBridgeLoadGroups(req CreateNetworkBridgeRequest) ([]NetworkBridgeLoadGroup, error) {
+	if len(req.LoadGroups) > 0 && len(req.LoadGroupVLANs) > 0 {
+		return nil, fmt.Errorf("specify either LoadGroups or LoadGroupVLANs, not both")
+	}
+
+	groups := append([]NetworkBridgeLoadGroup(nil), req.LoadGroups...)
+	for _, vlan := range req.LoadGroupVLANs {
+		groups = append(groups, NetworkBridgeLoadGroup{PortVLANID: vlan})
+	}
+
+	if len(groups) == 0 && !req.LoadBalancingEnabled {
+		groups = []NetworkBridgeLoadGroup{{PortVLANID: req.PortVLANID}}
+	}
+	return groups, nil
+}
+
+// validateCreateNetworkBridgeRequest applies the NetworkBridge rules documented in the
+// HMC REST API: failover needs two SEAs, at least one LoadGroup (two with load
+// balancing), and one LoadGroup PVID must equal the bridge PortVLANID. ControlChannelID
+// is not enforced because it is optional on ManagementVLANForControlChannelCapable
+// systems; the HMC reports the error when it is required and missing.
+func validateCreateNetworkBridgeRequest(req CreateNetworkBridgeRequest, groups []NetworkBridgeLoadGroup) error {
+	if req.PortVLANID < 1 || req.PortVLANID > 4094 {
+		return fmt.Errorf("PortVLANID must be between 1 and 4094")
+	}
+	if req.PrimaryViosUUID == "" || req.PrimaryBackingDevice == "" {
+		return fmt.Errorf("PrimaryViosUUID and PrimaryBackingDevice are required")
+	}
+	if req.ControlChannelID < 0 || req.ControlChannelID > 4094 {
+		return fmt.Errorf("ControlChannelID must be between 1 and 4094 when specified")
+	}
+
+	if req.FailoverEnabled {
+		if req.SecondaryViosUUID == "" || req.SecondaryBackingDevice == "" {
+			return fmt.Errorf("SecondaryViosUUID and SecondaryBackingDevice are required when FailoverEnabled is true")
+		}
+		if req.PrimaryViosUUID == req.SecondaryViosUUID {
+			return fmt.Errorf("primary and secondary VIOS must be different")
+		}
+	}
+
+	minimumGroups := 1
+	if req.LoadBalancingEnabled {
+		if !req.FailoverEnabled {
+			return fmt.Errorf("LoadBalancingEnabled requires FailoverEnabled")
+		}
+		minimumGroups = 2
+	}
+	if len(groups) < minimumGroups {
+		return fmt.Errorf("NetworkBridge requires at least %d LoadGroup(s) (set LoadGroups or LoadGroupVLANs); "+
+			"load balancing needs two or more LoadGroups, not necessarily newly created Virtual Networks", minimumGroups)
+	}
+
+	seen := make(map[int]struct{}, len(groups))
+	bridgePVIDPresent := false
+	for i, g := range groups {
+		if g.PortVLANID < 1 || g.PortVLANID > 4094 {
+			return fmt.Errorf("LoadGroups[%d].PortVLANID %d must be between 1 and 4094", i, g.PortVLANID)
+		}
+		if _, dup := seen[g.PortVLANID]; dup {
+			return fmt.Errorf("duplicate LoadGroup PVID %d", g.PortVLANID)
+		}
+		seen[g.PortVLANID] = struct{}{}
+		if g.PortVLANID == req.PortVLANID {
+			bridgePVIDPresent = true
+		}
+	}
+	if !bridgePVIDPresent {
+		return fmt.Errorf("one LoadGroup must use PortVLANID %d, matching the NetworkBridge PortVLANID", req.PortVLANID)
+	}
+	return nil
+}
+
+// truncateErrorBody trims an HMC response body for inclusion in an error message.
+func truncateErrorBody(body []byte, limit int) string {
+	text := strings.TrimSpace(string(body))
+	if len(text) <= limit {
+		return text
+	}
+	return text[:limit] + "..."
+}
+
 // CreateNetworkBridge provisions a new Network Bridge (Shared Ethernet Adapter wrapper).
 // It automatically supports both standard Active/Standby HA Failover and Active/Active Load Balancing layouts.
 func (c *RestClient) CreateNetworkBridge(ctx context.Context, sysUUID string, req CreateNetworkBridgeRequest) (*NetworkBridge, error) {
 	url := fmt.Sprintf("https://%s/rest/api/uom/ManagedSystem/%s/NetworkBridge", c.hmcIP, sysUUID)
 
-
-	// 1. Setup the collection of Load Group VLANs (default to root PortVLANID if none provided)
-	vlans := req.LoadGroupVLANs
-	if len(vlans) == 0 {
-		vlans = []int{req.PortVLANID}
-	}
-
-	if req.LoadBalancingEnabled && len(vlans) < 2 {
-		return nil, fmt.Errorf("at least two data load group VLAN IDs must be provided via LoadGroupVLANs when LoadBalancingEnabled is true")
-	}
-
-	// 2. Query all Virtual Networks once from the HMC to optimize dynamic identifier matching
-	vNets, err := c.GetVirtualNetworks(ctx, sysUUID)
+	// 1. Normalize and validate the LoadGroups before contacting the HMC
+	groups, err := normalizeNetworkBridgeLoadGroups(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch Virtual Networks for infrastructure alignment: %v", err)
+		return nil, err
+	}
+	if err := validateCreateNetworkBridgeRequest(req, groups); err != nil {
+		return nil, err
+	}
+
+	// 2. Resolve Virtual Networks for groups that did not supply explicit UUIDs
+	var vNets []VirtualNetwork
+	for _, g := range groups {
+		if len(g.VirtualNetworkUUIDs) == 0 {
+			vNets, err = c.GetVirtualNetworks(ctx, sysUUID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to fetch Virtual Networks for infrastructure alignment: %v", err)
+			}
+			break
+		}
 	}
 
 	// 3. Dynamically assemble the ordered sequential LoadGroups child elements
 	var loadGroupsSB strings.Builder
 	loadGroupsSB.WriteString("<LoadGroups schemaVersion=\"V1_0\">")
 
-	for _, vlan := range vlans {
-		var vNetUUID string
-		for _, vn := range vNets {
-			if vn.NetworkVLANID == vlan {
-				vNetUUID = vn.UUID
-				break
+	for _, g := range groups {
+		uuids := g.VirtualNetworkUUIDs
+		if len(uuids) == 0 {
+			for _, vn := range vNets {
+				if vn.NetworkVLANID == g.PortVLANID {
+					uuids = []string{vn.UUID}
+					break
+				}
 			}
 		}
-		if vNetUUID == "" {
-			return nil, fmt.Errorf("failed to find an existing Virtual Network matching VLAN ID %d; please create it first", vlan)
+		if len(uuids) == 0 {
+			return nil, fmt.Errorf("failed to find an existing Virtual Network matching VLAN ID %d; please create it first", g.PortVLANID)
 		}
 
 		loadGroupsSB.WriteString(fmt.Sprintf(`
         <LoadGroup schemaVersion="V1_0">
             <PortVLANID>%d</PortVLANID>
-            <VirtualNetworks>
-                <link href="https://%s:443/rest/api/uom/ManagedSystem/%s/VirtualNetwork/%s" rel="related"/>
+            <VirtualNetworks>`, g.PortVLANID))
+		for _, u := range uuids {
+			loadGroupsSB.WriteString(fmt.Sprintf(`
+                <link href="https://%s:443/rest/api/uom/ManagedSystem/%s/VirtualNetwork/%s" rel="related"/>`, c.hmcIP, sysUUID, u))
+		}
+		loadGroupsSB.WriteString(`
             </VirtualNetworks>
-        </LoadGroup>`, vlan, c.hmcIP, sysUUID, vNetUUID))
+        </LoadGroup>`)
 	}
 	loadGroupsSB.WriteString("\n    </LoadGroups>")
 	loadGroupsXML := loadGroupsSB.String()
@@ -1394,15 +1490,10 @@ func (c *RestClient) CreateNetworkBridge(ctx context.Context, sysUUID string, re
 	// 4. Construct optional Failover HA payload blocks (Strict JAXB Sorting Rules)
 	controlChannelXML := ""
 	secondarySEAXML := ""
-	if req.FailoverEnabled {
-		if req.ControlChannelID <= 0 {
-			return nil, fmt.Errorf("ControlChannelID must be specified and > 0 when FailoverEnabled is true")
-		}
-		if req.SecondaryViosUUID == "" || req.SecondaryBackingDevice == "" {
-			return nil, fmt.Errorf("Secondary VIOS UUID and Backing Device are required for Failover configurations")
-		}
+	if req.ControlChannelID > 0 {
 		controlChannelXML = fmt.Sprintf("<ControlChannelID>%d</ControlChannelID>", req.ControlChannelID)
-
+	}
+	if req.FailoverEnabled {
 		// Order sequence: AssignedVirtualIOServer -> BackingDeviceChoice -> JumboFramesEnabled -> IsPrimary -> LargeSend
 		secondarySEAXML = fmt.Sprintf(`
         <SharedEthernetAdapter schemaVersion="V1_0">
@@ -1472,7 +1563,11 @@ func (c *RestClient) CreateNetworkBridge(ctx context.Context, sysUUID string, re
 	}
 
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("NetworkBridge creation failed (%s)", resp.Status)
+		message := truncateErrorBody(body, 2000)
+		if message == "" {
+			message = http.StatusText(resp.StatusCode)
+		}
+		return nil, fmt.Errorf("NetworkBridge creation failed: %s: %s", resp.Status, message)
 	}
 
 	doc, err := xmlStripNamespace(body)
