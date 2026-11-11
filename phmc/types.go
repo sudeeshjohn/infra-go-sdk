@@ -4080,6 +4080,11 @@ type CreateVirtualSwitchRequest struct {
 type LoadGroup struct {
 	PortVLANID      int       `xml:"PortVLANID"`
 	VirtualSwitches []LinkXML `xml:"VirtualSwitches>link"`
+	// VirtualNetworks are the links to the Virtual Networks associated with this LoadGroup.
+	VirtualNetworks []LinkXML `xml:"VirtualNetworks>link"`
+	// AssociatedInternalNetwork is how the HMC reports the Virtual Network of a LoadGroup
+	// whose PVID differs from the NetworkBridge PortVLANID.
+	AssociatedInternalNetwork []LinkXML `xml:"AssociatedInternalNetwork>link"`
 }
 
 // NetworkBridge represents the REST API wrapper for Shared Ethernet Adapters.
