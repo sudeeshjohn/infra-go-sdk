@@ -947,7 +947,9 @@ func (c *RestClient) DeleteVirtualNetwork(ctx context.Context, sysUUID, vnetUUID
 	}
 
 	req.Header.Set("X-API-Session", c.session)
-	req.Header.Set("Accept", "application/vnd.ibm.powervm.uom+xml")
+	// The HMC returned 406 Not Acceptable for DELETE with
+	// Accept: application/vnd.ibm.powervm.uom+xml; use atom+xml.
+	req.Header.Set("Accept", "application/atom+xml")
 
 
 	resp, err := c.client.Do(req)
@@ -1593,7 +1595,10 @@ func (c *RestClient) DeleteNetworkBridge(ctx context.Context, sysUUID, bridgeUUI
 	}
 
 	req.Header.Set("X-API-Session", c.session)
-	req.Header.Set("Accept", "application/vnd.ibm.powervm.uom+xml")
+	// The HMC returned 406 Not Acceptable for DELETE with
+	// Accept: application/vnd.ibm.powervm.uom+xml; use atom+xml like the
+	// NetworkBridge POST and other DELETE calls in this package.
+	req.Header.Set("Accept", "application/atom+xml")
 
 
 	resp, err := c.client.Do(req)
