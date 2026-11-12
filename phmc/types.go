@@ -5,6 +5,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/beevik/etree"
@@ -117,6 +118,11 @@ type RestClient struct {
 	hmcIP   string
 	session string
 	client  *http.Client
+
+	// viosAdminPass holds the randomly generated viosadmin password for this
+	// client's lifetime (in memory only). Guarded by viosAdminMu.
+	viosAdminMu   sync.Mutex
+	viosAdminPass string
 }
 
 // NewRestClient initializes a new RestClient.

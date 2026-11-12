@@ -2,12 +2,12 @@ package hmc
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/base64"
+	"crypto/rand"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"strings"
 	"time"
@@ -500,24 +500,55 @@ func (c *RestClient) CliRunner(ctx context.Context, cmdString string) (string, e
 	return cmdOutput, nil
 }
 
-// generateVIOSAdminPassword creates a deterministic password based on HMC IP
-// This ensures the same password is used across all PowerShift invocations
-func (c *RestClient) generateVIOSAdminPassword() string {
-	salt := "PowerShift-VIOS-Admin-2026"
-	data := c.hmcIP + salt
+const viosAdminUsername = "viosadmin"
 
-	hash := sha256.Sum256([]byte(data))
-	// Convert to base64 and take first 20 characters
-	password := base64.StdEncoding.EncodeToString(hash[:])[:20]
+// generateVIOSAdminPassword returns a cryptographically random password that
+// contains at least one lower-case letter, upper-case letter, digit and
+// special character. The character set avoids shell metacharacters because the
+// value is passed on an HMC CLI command line.
+func generateVIOSAdminPassword() (string, error) {
+	const (
+		lower   = "abcdefghijkmnopqrstuvwxyz"
+		upper   = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+		digits  = "23456789"
+		special = "-_+="
+		length  = 24
+	)
+	all := lower + upper + digits + special
 
-	// Add special characters to meet HMC password requirements
-	return password + "!Ps"
-}
+	pick := func(set string) (byte, error) {
+		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(set))))
+		if err != nil {
+			return 0, err
+		}
+		return set[n.Int64()], nil
+	}
 
-// GetVIOSAdminCredentials returns the viosadmin credentials
-// Assumes viosadmin user already exists on HMC
-func (c *RestClient) GetVIOSAdminCredentials() (username, password string) {
-	return "viosadmin", c.generateVIOSAdminPassword()
+	pw := make([]byte, length)
+	for i, set := range []string{lower, upper, digits, special} {
+		b, err := pick(set)
+		if err != nil {
+			return "", err
+		}
+		pw[i] = b
+	}
+	for i := 4; i < length; i++ {
+		b, err := pick(all)
+		if err != nil {
+			return "", err
+		}
+		pw[i] = b
+	}
+	// Shuffle (Fisher-Yates) so the guaranteed characters are not positional.
+	for i := length - 1; i > 0; i-- {
+		n, err := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
+		if err != nil {
+			return "", err
+		}
+		j := n.Int64()
+		pw[i], pw[j] = pw[j], pw[i]
+	}
+	return string(pw), nil
 }
 
 // CheckVIOSAdminUser checks if viosadmin user exists on HMC
@@ -543,10 +574,30 @@ func (c *RestClient) CheckVIOSAdminUser(ctx context.Context, hmcUsername, hmcPas
 	return false, nil
 }
 
-// EnsureVIOSAdminUser checks if viosadmin user exists, creates it if not
-// Returns the username, password, and whether the user was created (true) or already existed (false)
+// EnsureVIOSAdminUser makes sure a usable viosadmin account exists on the HMC.
+//
+// The password is never derived from public inputs: a fresh random password is
+// generated and set on the account (created if missing, reset via chhmcusr if it
+// already exists, which also replaces any legacy derived password). It is kept
+// in memory on the RestClient for the lifetime of the client and returned to the
+// caller; it is not persisted by the SDK. Repeated calls on the same client
+// reuse the in-memory password instead of rotating it again.
+//
+// Returns the username, password, and whether the user was created (true) or
+// already existed (false).
 func (c *RestClient) EnsureVIOSAdminUser(ctx context.Context, hmcUsername, hmcPassword string) (username, password string, created bool, err error) {
-	username, password = c.GetVIOSAdminCredentials()
+	c.viosAdminMu.Lock()
+	defer c.viosAdminMu.Unlock()
+
+	username = viosAdminUsername
+	if c.viosAdminPass != "" {
+		return username, c.viosAdminPass, false, nil
+	}
+
+	password, err = generateVIOSAdminPassword()
+	if err != nil {
+		return "", "", false, fmt.Errorf("failed to generate viosadmin password: %w", err)
+	}
 
 	// Check if user already exists
 	exists, err := c.CheckVIOSAdminUser(ctx, hmcUsername, hmcPassword)
@@ -555,6 +606,11 @@ func (c *RestClient) EnsureVIOSAdminUser(ctx context.Context, hmcUsername, hmcPa
 	}
 
 	if exists {
+		resetCmd := fmt.Sprintf(`chhmcusr -u %s -t passwd -v %s`, username, password)
+		if _, err = CliRunnerViaSSH(c.hmcIP, hmcUsername, hmcPassword, resetCmd); err != nil {
+			return "", "", false, fmt.Errorf("failed to reset viosadmin password: %w", err)
+		}
+		c.viosAdminPass = password
 		return username, password, false, nil
 	}
 
@@ -579,26 +635,25 @@ func (c *RestClient) EnsureVIOSAdminUser(ctx context.Context, hmcUsername, hmcPa
 		return "", "", false, fmt.Errorf("failed to create viosadmin user: %w", err)
 	}
 
-
+	c.viosAdminPass = password
 	return username, password, true, nil
 }
 
-// RunVIOSCommandAsAdmin executes a viosvrcmd with --admin flag using viosadmin credentials
-// Uses SSH to authenticate as viosadmin user
+// RunVIOSCommandAsAdmin executes a viosvrcmd with --admin flag as the viosadmin
+// user over a host-key-verified SSH connection to the HMC.
+// EnsureVIOSAdminUser must have been called on this client first.
 func (c *RestClient) RunVIOSCommandAsAdmin(ctx context.Context, systemName, viosName, command string) (string, error) {
-	viosAdminUser, viosAdminPass := c.GetVIOSAdminCredentials()
+	c.viosAdminMu.Lock()
+	pass := c.viosAdminPass
+	c.viosAdminMu.Unlock()
+	if pass == "" {
+		return "", fmt.Errorf("viosadmin credentials not available: call EnsureVIOSAdminUser first")
+	}
 
-	// Build the full viosvrcmd command with --admin flag
 	viosCmd := fmt.Sprintf(`viosvrcmd -m %s -p %s -c "%s" --admin`,
 		systemName, viosName, command)
 
-	// Use sshpass to execute command as viosadmin
-	sshCmd := fmt.Sprintf(`sshpass -p '%s' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null %s@%s '%s'`,
-		viosAdminPass, viosAdminUser, c.hmcIP, viosCmd)
-
-
-	// Execute via CliRunner (which will run the SSH command)
-	return c.CliRunner(ctx, sshCmd)
+	return CliRunnerViaSSH(c.hmcIP, viosAdminUsername, pass, viosCmd)
 }
 
 // GetSRIOVAdapters fetches the detailed Managed System configuration and extracts all SR-IOV adapters.
